@@ -67,15 +67,6 @@ type Escrow struct {
 	State  State
 }
 
-var transitions = map[State][]State{
-	Unpaid:    {Funded, Cancelled},
-	Funded:    {Released, Refunded, Disputed},
-	Disputed:  {Refunded, Released},
-	Released:  {},
-	Refunded:  {},
-	Cancelled: {},
-}
-
 type Store interface {
 	Create(token string, e *Escrow) (*Escrow, error)
 	Get(id uuid.UUID) (*Escrow, error)
@@ -86,6 +77,15 @@ type MemoryStore struct {
 	mu      sync.Mutex
 	escrows map[uuid.UUID]Escrow
 	tokens  map[string]uuid.UUID
+}
+
+var transitions = map[State][]State{
+	Unpaid:    {Funded, Cancelled},
+	Funded:    {Released, Refunded, Disputed},
+	Disputed:  {Refunded, Released},
+	Released:  {},
+	Refunded:  {},
+	Cancelled: {},
 }
 
 func canTransit(from, to State) bool {
