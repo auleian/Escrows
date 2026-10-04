@@ -1,0 +1,18 @@
+# secrets and local config
+.env
+.env.*
+!.env.example
+
+# built programs
+*.exe
+*.test
+*.out
+
+# editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# coverage output
+coverage.*
