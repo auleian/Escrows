@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -477,5 +478,466 @@ func TestStore_ConcurrentMovesOnlyOneWins(t *testing.T) {
 	got, _ := s.Get(created.ID)
 	if got.State != Funded {
 		t.Errorf("final state = %q, want %q", got.State, Funded)
+	}
+}
+
+// --- fakes: a pretend provider and a pretend clock ---
+
+var _ Provider = (*fakeProvider)(nil)
+
+type requestCall struct {
+	Ref    uuid.UUID
+	Phone  string
+	Amount int64
+}
+
+type fakeProvider struct {
+	mu         sync.Mutex
+	requests   []requestCall
+	requestErr error
+	checkErr   error
+	results    map[uuid.UUID]PaymentResult
+}
+
+func newFakeProvider() *fakeProvider {
+	return &fakeProvider{results: make(map[uuid.UUID]PaymentResult)}
+}
+
+func (f *fakeProvider) RequestPayment(ref uuid.UUID, phone string, amount int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.requestErr != nil {
+		return f.requestErr
+	}
+	f.requests = append(f.requests, requestCall{ref, phone, amount})
+	return nil
+}
+
+func (f *fakeProvider) CheckStatus(ref uuid.UUID) (PaymentResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.checkErr != nil {
+		return PaymentResult{}, f.checkErr
+	}
+	if r, ok := f.results[ref]; ok {
+		return r, nil
+	}
+	return PaymentResult{Status: PaymentPending}, nil // no answer yet
+}
+
+func (f *fakeProvider) setResult(ref uuid.UUID, r PaymentResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results[ref] = r
+}
+
+func (f *fakeProvider) requestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
+}
+
+func (f *fakeProvider) lastRequest() requestCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests[len(f.requests)-1]
+}
+
+type fakeClock struct{ now time.Time }
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{now: time.Date(2026, 10, 5, 14, 0, 0, 0, time.UTC)}
+}
+func (c *fakeClock) Now() time.Time          { return c.now }
+func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+// --- setup ---
+
+type paymentEnv struct {
+	svc    *PaymentService
+	store  *MemoryStore
+	prov   *fakeProvider
+	clock  *fakeClock
+	escrow *Escrow // an unpaid escrow, price 50000
+}
+
+func newPaymentEnv(t *testing.T) *paymentEnv {
+	t.Helper()
+	store := NewMemoryStore()
+	prov := newFakeProvider()
+	clock := newFakeClock()
+	svc := NewPaymentService(store, prov, clock.Now)
+	escrow := createValid(t, store, "tok-1")
+	return &paymentEnv{svc, store, prov, clock, escrow}
+}
+
+func (env *paymentEnv) stateOf(t *testing.T) State {
+	t.Helper()
+	got, err := env.store.Get(env.escrow.ID)
+	if err != nil {
+		t.Fatalf("setup: Get returned error: %v", err)
+	}
+	return got.State
+}
+
+// force puts the stored escrow into any state, for test setup only.
+func (env *paymentEnv) force(t *testing.T, st State) {
+	t.Helper()
+	err := env.store.Update(env.escrow.ID, func(e *Escrow) error {
+		e.State = st
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("setup: Update returned error: %v", err)
+	}
+}
+
+func (env *paymentEnv) start(t *testing.T) *Payment {
+	t.Helper()
+	p, err := env.svc.StartPayment(env.escrow.ID)
+	if err != nil {
+		t.Fatalf("setup: StartPayment returned error: %v", err)
+	}
+	return p
+}
+
+func (env *paymentEnv) providerSays(ref uuid.UUID, status PaymentStatus, amount int64) {
+	env.prov.setResult(ref, PaymentResult{Status: status, Amount: amount, TransactionID: "tx-123"})
+}
+
+// --- starting a payment ---
+
+func TestStartPayment_CreatesPendingAttempt(t *testing.T) {
+	env := newPaymentEnv(t)
+	p, err := env.svc.StartPayment(env.escrow.ID)
+	if err != nil {
+		t.Fatalf("StartPayment returned error: %v", err)
+	}
+	if p.Reference == uuid.Nil {
+		t.Error("payment has an empty reference")
+	}
+	if p.EscrowID != env.escrow.ID {
+		t.Errorf("EscrowID = %v, want %v", p.EscrowID, env.escrow.ID)
+	}
+	if p.Amount != env.escrow.Order.Price {
+		t.Errorf("Amount = %d, want the escrow price %d", p.Amount, env.escrow.Order.Price)
+	}
+	if p.Status != PaymentPending {
+		t.Errorf("Status = %q, want %q", p.Status, PaymentPending)
+	}
+	if !p.CreatedAt.Equal(env.clock.Now()) {
+		t.Errorf("CreatedAt = %v, want %v", p.CreatedAt, env.clock.Now())
+	}
+
+	if env.prov.requestCount() != 1 {
+		t.Fatalf("provider got %d requests, want 1", env.prov.requestCount())
+	}
+	req := env.prov.lastRequest()
+	if req.Ref != p.Reference || req.Phone != env.escrow.Buyer.Phone || req.Amount != env.escrow.Order.Price {
+		t.Errorf("provider request = %+v, want the payment's reference, the buyer's phone and the price", req)
+	}
+}
+
+func TestStartPayment_UnknownEscrow(t *testing.T) {
+	env := newPaymentEnv(t)
+	p, err := env.svc.StartPayment(uuid.New())
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+	if p != nil {
+		t.Errorf("got payment %+v, want nil", p)
+	}
+	if env.prov.requestCount() != 0 {
+		t.Errorf("provider got %d requests, want 0", env.prov.requestCount())
+	}
+}
+
+func TestStartPayment_RefusedUnlessEscrowIsUnpaid(t *testing.T) {
+	for _, st := range allStates {
+		if st == Unpaid {
+			continue
+		}
+		t.Run(string(st), func(t *testing.T) {
+			env := newPaymentEnv(t)
+			env.force(t, st)
+			_, err := env.svc.StartPayment(env.escrow.ID)
+			if !errors.Is(err, ErrNotPayable) {
+				t.Errorf("error = %v, want ErrNotPayable", err)
+			}
+			if env.prov.requestCount() != 0 {
+				t.Errorf("provider got %d requests, want 0", env.prov.requestCount())
+			}
+		})
+	}
+}
+
+func TestStartPayment_SecondWhilePendingIsRefused(t *testing.T) {
+	env := newPaymentEnv(t)
+	env.start(t)
+
+	p, err := env.svc.StartPayment(env.escrow.ID)
+	if !errors.Is(err, ErrPaymentInProgress) {
+		t.Errorf("error = %v, want ErrPaymentInProgress", err)
+	}
+	if p != nil {
+		t.Errorf("got payment %+v, want nil", p)
+	}
+	if env.prov.requestCount() != 1 {
+		t.Errorf("provider got %d requests, want 1", env.prov.requestCount())
+	}
+}
+
+func TestStartPayment_ProviderRefusalLeavesNothingPending(t *testing.T) {
+	env := newPaymentEnv(t)
+	env.prov.requestErr = errors.New("provider is down")
+
+	if _, err := env.svc.StartPayment(env.escrow.ID); err == nil {
+		t.Fatal("expected an error when the provider refuses, got nil")
+	}
+
+	env.prov.requestErr = nil
+	if _, err := env.svc.StartPayment(env.escrow.ID); err != nil {
+		t.Errorf("a retry after a provider refusal returned error: %v", err)
+	}
+}
+
+func TestStartPayment_NewAttemptAfterFailureGetsNewReference(t *testing.T) {
+	env := newPaymentEnv(t)
+	first := env.start(t)
+	env.providerSays(first.Reference, PaymentFailed, 0)
+	if _, err := env.svc.Check(first.Reference); err != nil {
+		t.Fatalf("setup: Check returned error: %v", err)
+	}
+
+	second, err := env.svc.StartPayment(env.escrow.ID)
+	if err != nil {
+		t.Fatalf("a new attempt after a failed one returned error: %v", err)
+	}
+	if second.Reference == first.Reference {
+		t.Error("the new attempt reused the old reference")
+	}
+}
+
+func TestStartPayment_ConcurrentOnlyOneWins(t *testing.T) {
+	env := newPaymentEnv(t)
+
+	const n = 20
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	wins, inProgress := 0, 0
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := env.svc.StartPayment(env.escrow.ID)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				wins++
+			case errors.Is(err, ErrPaymentInProgress):
+				inProgress++
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if wins != 1 {
+		t.Errorf("%d attempts started, want exactly 1", wins)
+	}
+	if inProgress != n-1 {
+		t.Errorf("%d attempts refused as in progress, want %d", inProgress, n-1)
+	}
+	if env.prov.requestCount() != 1 {
+		t.Errorf("provider got %d requests, want 1", env.prov.requestCount())
+	}
+}
+
+// --- checking a payment ---
+
+func TestCheck_SuccessFundsTheEscrow(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.providerSays(p.Reference, PaymentSucceeded, env.escrow.Order.Price)
+
+	got, err := env.svc.Check(p.Reference)
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if got.Status != PaymentSucceeded {
+		t.Errorf("payment status = %q, want %q", got.Status, PaymentSucceeded)
+	}
+	if got.TransactionID != "tx-123" {
+		t.Errorf("TransactionID = %q, want the provider's %q", got.TransactionID, "tx-123")
+	}
+	if st := env.stateOf(t); st != Funded {
+		t.Errorf("escrow state = %q, want %q", st, Funded)
+	}
+}
+
+func TestCheck_SuccessTwiceIsHarmless(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.providerSays(p.Reference, PaymentSucceeded, env.escrow.Order.Price)
+
+	for i := 1; i <= 2; i++ {
+		if _, err := env.svc.Check(p.Reference); err != nil {
+			t.Fatalf("Check #%d returned error: %v", i, err)
+		}
+	}
+	if st := env.stateOf(t); st != Funded {
+		t.Errorf("escrow state = %q, want %q", st, Funded)
+	}
+}
+
+func TestCheck_AmountMismatchLeavesEscrowUnpaid(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.providerSays(p.Reference, PaymentSucceeded, 1) // not the price
+
+	_, err := env.svc.Check(p.Reference)
+	if !errors.Is(err, ErrAmountMismatch) {
+		t.Errorf("error = %v, want ErrAmountMismatch", err)
+	}
+	if st := env.stateOf(t); st != Unpaid {
+		t.Errorf("escrow state = %q, want it to stay %q", st, Unpaid)
+	}
+}
+
+func TestCheck_ProviderSaysFailed(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.providerSays(p.Reference, PaymentFailed, 0)
+
+	got, err := env.svc.Check(p.Reference)
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if got.Status != PaymentFailed {
+		t.Errorf("payment status = %q, want %q", got.Status, PaymentFailed)
+	}
+	if st := env.stateOf(t); st != Unpaid {
+		t.Errorf("escrow state = %q, want it to stay %q", st, Unpaid)
+	}
+}
+
+func TestCheck_StaysPendingBeforeFiveMinutes(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.clock.Advance(4*time.Minute + 59*time.Second)
+
+	got, err := env.svc.Check(p.Reference)
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if got.Status != PaymentPending {
+		t.Errorf("payment status = %q, want %q", got.Status, PaymentPending)
+	}
+}
+
+func TestCheck_FailsAfterFiveMinutes(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.clock.Advance(5*time.Minute + time.Second)
+
+	got, err := env.svc.Check(p.Reference)
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if got.Status != PaymentFailed {
+		t.Errorf("payment status = %q, want %q", got.Status, PaymentFailed)
+	}
+	if st := env.stateOf(t); st != Unpaid {
+		t.Errorf("escrow state = %q, want it to stay %q", st, Unpaid)
+	}
+	if _, err := env.svc.StartPayment(env.escrow.ID); err != nil {
+		t.Errorf("a new attempt after a timeout returned error: %v", err)
+	}
+}
+
+func TestCheck_ProviderErrorKeepsAttemptPending(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+
+	env.prov.checkErr = errors.New("provider unreachable")
+	if _, err := env.svc.Check(p.Reference); err == nil {
+		t.Fatal("expected an error when the provider is unreachable, got nil")
+	}
+
+	env.prov.checkErr = nil
+	got, err := env.svc.Check(p.Reference)
+	if err != nil {
+		t.Fatalf("Check after recovery returned error: %v", err)
+	}
+	if got.Status != PaymentPending {
+		t.Errorf("payment status = %q, want it still %q", got.Status, PaymentPending)
+	}
+}
+
+func TestCheck_UnknownReference(t *testing.T) {
+	env := newPaymentEnv(t)
+	got, err := env.svc.Check(uuid.New())
+	if !errors.Is(err, ErrPaymentNotFound) {
+		t.Errorf("error = %v, want ErrPaymentNotFound", err)
+	}
+	if got != nil {
+		t.Errorf("got payment %+v, want nil", got)
+	}
+}
+
+// --- cancelling ---
+
+func TestCancel_BlockedWhilePaymentPending(t *testing.T) {
+	env := newPaymentEnv(t)
+	env.start(t)
+
+	err := env.svc.CancelEscrow(env.escrow.ID)
+	if !errors.Is(err, ErrPaymentInProgress) {
+		t.Errorf("error = %v, want ErrPaymentInProgress", err)
+	}
+	if st := env.stateOf(t); st != Unpaid {
+		t.Errorf("escrow state = %q, want it to stay %q", st, Unpaid)
+	}
+}
+
+func TestCancel_AllowedWithNoPayment(t *testing.T) {
+	env := newPaymentEnv(t)
+	if err := env.svc.CancelEscrow(env.escrow.ID); err != nil {
+		t.Fatalf("CancelEscrow returned error: %v", err)
+	}
+	if st := env.stateOf(t); st != Cancelled {
+		t.Errorf("escrow state = %q, want %q", st, Cancelled)
+	}
+}
+
+func TestCancel_AllowedAfterAttemptTimedOut(t *testing.T) {
+	env := newPaymentEnv(t)
+	p := env.start(t)
+	env.clock.Advance(6 * time.Minute)
+	if _, err := env.svc.Check(p.Reference); err != nil {
+		t.Fatalf("setup: Check returned error: %v", err)
+	}
+
+	if err := env.svc.CancelEscrow(env.escrow.ID); err != nil {
+		t.Fatalf("CancelEscrow returned error: %v", err)
+	}
+	if st := env.stateOf(t); st != Cancelled {
+		t.Errorf("escrow state = %q, want %q", st, Cancelled)
+	}
+}
+
+func TestCancel_RefusedWhenNotUnpaid(t *testing.T) {
+	env := newPaymentEnv(t)
+	env.force(t, Funded)
+
+	err := env.svc.CancelEscrow(env.escrow.ID)
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Errorf("error = %v, want ErrInvalidTransition", err)
+	}
+	if st := env.stateOf(t); st != Funded {
+		t.Errorf("escrow state = %q, want it to stay %q", st, Funded)
 	}
 }
